@@ -3,25 +3,25 @@ import { toast } from "sonner";
 
 // Define our types
 type Transaction = {
-  id: string;
+  id: number;
+  sender_id: number;
+  receiver_id: number;
   amount: number;
-  recipient: string;
-  sender: string;
-  timestamp: Date;
-  status: "completed" | "pending" | "failed";
-  type: "send" | "receive";
+  timestamp: string;
+};
+
+type User = {
+  id: number;
+  name: string;
+  balance: number;
 };
 
 type UpiContextType = {
-  isOnline: boolean;
-  toggleOnline: () => void;
-  ledgerBalance: number;
-  actualBalance: number;
+  users: User[];
   transactions: Transaction[];
-  pendingTransactions: Transaction[];
-  sendMoney: (amount: number, recipient: string, pin: string) => Promise<boolean>;
-  receiveMoney: (amount: number, sender: string) => void;
-  syncLedger: () => void;
+  currentUser: User | null;
+  setCurrentUser: (user: User) => void;
+  sendMoney: (amount: number, recipientId: number) => Promise<boolean>;
   upiId: string;
 };
 
@@ -36,143 +36,94 @@ export const useUpi = () => {
 };
 
 export const UpiProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [isOnline, setIsOnline] = useState(true);
-  const [ledgerBalance, setLedgerBalance] = useState(10000);
-  const [actualBalance, setActualBalance] = useState(10000);
+  const [users, setUsers] = useState<User[]>([]);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [pendingTransactions, setPendingTransactions] = useState<Transaction[]>([]);
-  const [upiId, setUpiId] = useState("user@payzzle");
-  
-  const PIN = "1234"; // This would normally be securely stored/verified
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [socket, setSocket] = useState<WebSocket | null>(null);
+  const upiId = currentUser ? `${currentUser.name.toLowerCase()}@payzzle` : "";
 
-  // Sync balances when coming online
   useEffect(() => {
-    if (isOnline && pendingTransactions.length > 0) {
-      syncLedger();
-    }
-  }, [isOnline]);
+    const ws = new WebSocket("ws://localhost:8080");
 
-  const toggleOnline = () => {
-    const newStatus = !isOnline;
-    setIsOnline(newStatus);
-    if (newStatus) {
-      toast.info("You are now online");
-    } else {
-      toast.info("You are now offline");
-    }
-  };
+    ws.onopen = () => {
+      console.log("WebSocket connected");
+      setSocket(ws);
+    };
 
-  const sendMoney = async (amount: number, recipient: string, pin: string): Promise<boolean> => {
-    // Validate PIN
-    if (pin !== PIN) {
-      toast.error("Incorrect UPI PIN");
+    ws.onmessage = (event) => {
+      const message = JSON.parse(event.data);
+      if (message.type === 'users') {
+        setUsers(message.data);
+        if (!currentUser) {
+            setCurrentUser(message.data[0]);
+        }
+      } else if (message.type === 'transactions') {
+        setTransactions(message.data);
+      }
+    };
+
+    ws.onclose = () => {
+      console.log("WebSocket disconnected");
+      setSocket(null);
+    };
+
+    return () => {
+      ws.close();
+    };
+  }, [currentUser]);
+
+  const sendMoney = async (amount: number, recipientId: number): Promise<boolean> => {
+    if (!currentUser) {
+      toast.error("Please select a user");
       return false;
     }
 
-    // Check if amount is valid
     if (amount <= 0) {
       toast.error("Amount must be greater than 0");
       return false;
     }
 
-    // Check if sufficient balance in ledger
-    if (ledgerBalance < amount) {
+    if (currentUser.balance < amount) {
       toast.error("Insufficient balance");
       return false;
     }
 
-    const transaction: Transaction = {
-      id: Math.random().toString(36).substring(2, 15),
-      amount,
-      recipient,
-      sender: upiId,
-      timestamp: new Date(),
-      status: isOnline ? "completed" : "pending",
-      type: "send"
-    };
+    try {
+      const response = await fetch("http://localhost:8080/send", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          senderId: currentUser.id,
+          receiverId: recipientId,
+          amount,
+        }),
+      });
 
-    // Update ledger balance immediately
-    setLedgerBalance(prev => prev - amount);
-
-    // If online, update actual balance too
-    if (isOnline) {
-      setActualBalance(prev => prev - amount);
-      setTransactions(prev => [transaction, ...prev]);
-      toast.success(`₹${amount} sent to ${recipient}`);
-    } else {
-      // Save to pending transactions if offline
-      setPendingTransactions(prev => [...prev, transaction]);
-      toast.success(`₹${amount} will be sent when online`);
+      if (response.ok) {
+        toast.success(`₹${amount} sent successfully`);
+        return true;
+      } else {
+        const errorText = await response.text();
+        toast.error(errorText);
+        return false;
+      }
+    } catch (error) {
+      console.error("Error sending money:", error);
+      toast.error("Failed to send money");
+      return false;
     }
-    
-    return true;
-  };
-
-  const receiveMoney = (amount: number, sender: string) => {
-    const transaction: Transaction = {
-      id: Math.random().toString(36).substring(2, 15),
-      amount,
-      recipient: upiId,
-      sender,
-      timestamp: new Date(),
-      status: isOnline ? "completed" : "pending",
-      type: "receive"
-    };
-
-    // Update ledger balance immediately for all cases
-    setLedgerBalance(prev => prev + amount);
-    
-    if (isOnline) {
-      // If online, update actual balance and add to completed transactions
-      setActualBalance(prev => prev + amount);
-      setTransactions(prev => [transaction, ...prev]);
-      toast.success(`₹${amount} received from ${sender}`);
-    } else {
-      // If offline, add to pending transactions
-      setPendingTransactions(prev => [...prev, { ...transaction, status: "pending" }]);
-      toast.success(`₹${amount} will be received when online`);
-    }
-  };
-
-  const syncLedger = () => {
-    if (!isOnline) {
-      toast.error("Cannot sync while offline");
-      return;
-    }
-
-    if (pendingTransactions.length === 0) {
-      toast.info("No pending transactions to sync");
-      return;
-    }
-
-    // Process pending transactions
-    const completedTransactions = pendingTransactions.map(tx => ({
-      ...tx,
-      status: "completed" as const
-    }));
-    
-    // Update actual balance to match ledger
-    setActualBalance(ledgerBalance);
-    
-    // Move from pending to completed
-    setTransactions(prev => [...completedTransactions, ...prev]);
-    setPendingTransactions([]);
-    
-    toast.success(`Synced ${completedTransactions.length} transactions`);
   };
 
   // Context value
   const value = {
-    isOnline,
-    toggleOnline,
-    ledgerBalance,
-    actualBalance,
+    users,
     transactions,
-    pendingTransactions,
+    currentUser,
+    setCurrentUser,
     sendMoney,
-    receiveMoney,
-    syncLedger,
-    upiId
+    upiId,
   };
 
   return <UpiContext.Provider value={value}>{children}</UpiContext.Provider>;
