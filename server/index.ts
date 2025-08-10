@@ -19,10 +19,14 @@ db.serialize(() => {
 });
 
 wss.on('connection', (ws) => {
-  console.log('Client connected');
+  const clientId = Date.now().toString() + Math.random().toString();
+  console.log(`Client connected: ${clientId}`);
+
+  ws.send(JSON.stringify({ type: 'clientId', data: clientId }));
+
   sendUsersData(ws);
   ws.on('close', () => {
-    console.log('Client disconnected');
+    console.log(`Client disconnected: ${clientId}`);
   });
 });
 
@@ -35,18 +39,24 @@ function broadcast(data: any) {
 }
 
 function sendUsersData(ws: WebSocket) {
-    db.all("SELECT * FROM users", [], (err, rows) => {
-        if (err) {
-            console.error(err.message);
-            return;
-        }
-        ws.send(JSON.stringify({type: 'users', data: rows}));
-    });
+  db.all("SELECT * FROM users", [], (err, rows) => {
+    if (err) {
+      console.error(err.message);
+      return;
+    }
+    ws.send(JSON.stringify({ type: 'users', data: rows }));
+  });
 }
 
-
 app.post('/send', express.json(), (req, res) => {
-  const { senderId, receiverId, amount } = req.body;
+  let { senderId, receiverId, amount } = req.body;
+  senderId = Number(senderId);
+  receiverId = Number(receiverId);
+  amount = Number(amount);
+
+  if (!senderId || !receiverId || isNaN(amount) || amount <= 0) {
+    return res.status(400).send('Invalid input');
+  }
 
   db.get("SELECT balance FROM users WHERE id = ?", [senderId], (err, senderRow: any) => {
     if (err || !senderRow) {
@@ -57,61 +67,57 @@ app.post('/send', express.json(), (req, res) => {
     }
 
     db.get("SELECT balance FROM users WHERE id = ?", [receiverId], (err, receiverRow: any) => {
-        if (err || !receiverRow) {
-            return res.status(400).send('Invalid receiver');
-        }
+      if (err || !receiverRow) {
+        return res.status(400).send('Invalid receiver');
+      }
 
-        const newSenderBalance = senderRow.balance - amount;
-        const newReceiverBalance = receiverRow.balance + amount;
-
-        db.serialize(() => {
-            db.run("UPDATE users SET balance = ? WHERE id = ?", [newSenderBalance, senderId]);
-            db.run("UPDATE users SET balance = ? WHERE id = ?", [newReceiverBalance, receiverId]);
-            db.run("INSERT INTO transactions (sender_id, receiver_id, amount) VALUES (?, ?, ?)", [senderId, receiverId, amount]);
-
+      db.serialize(() => {
+        db.run("BEGIN TRANSACTION");
+        db.run("UPDATE users SET balance = balance - ? WHERE id = ?", [amount, senderId]);
+        db.run("UPDATE users SET balance = balance + ? WHERE id = ?", [amount, receiverId]);
+        db.run("INSERT INTO transactions (sender_id, receiver_id, amount) VALUES (?, ?, ?)", [senderId, receiverId, amount], function (err) {
+          if (err) {
+            db.run("ROLLBACK");
+            return res.status(500).send('Transaction failed');
+          }
+          db.run("COMMIT", (err) => {
+            if (err) {
+              return res.status(500).send('Commit failed');
+            }
             db.all("SELECT * FROM users", [], (err, rows) => {
-                if (err) {
-                    console.error(err.message);
-                    return;
-                }
-                broadcast({type: 'users', data: rows});
+              if (!err) broadcast({ type: 'users', data: rows });
             });
-
             db.all("SELECT * FROM transactions ORDER BY timestamp DESC LIMIT 10", [], (err, rows) => {
-                if (err) {
-                    console.error(err.message);
-                    return;
-                }
-                broadcast({type: 'transactions', data: rows});
+              if (!err) broadcast({ type: 'transactions', data: rows });
             });
+            res.status(200).send('Transaction successful');
+          });
         });
-
-        res.status(200).send('Transaction successful');
+      });
     });
   });
 });
 
 app.get('/users', (req, res) => {
-    db.all("SELECT * FROM users", [], (err, rows) => {
-        if (err) {
-            res.status(500).send(err.message);
-            return;
-        }
-        res.json(rows);
-    });
+  db.all("SELECT * FROM users", [], (err, rows) => {
+    if (err) {
+      res.status(500).send(err.message);
+      return;
+    }
+    res.json(rows);
+  });
 });
 
 app.get('/transactions', (req, res) => {
-    db.all("SELECT * FROM transactions ORDER BY timestamp DESC LIMIT 10", [], (err, rows) => {
-        if (err) {
-            res.status(500).send(err.message);
-            return;
-        }
-        res.json(rows);
-    });
+  db.all("SELECT * FROM transactions ORDER BY timestamp DESC LIMIT 10", [], (err, rows) => {
+    if (err) {
+      res.status(500).send(err.message);
+      return;
+    }
+    res.json(rows);
+  });
 });
 
-
-server.listen(8080, () => {
-  console.log('Server started on port 8080');
+server.listen(8081, () => {
+  console.log('Server started on port 8081');
 });
